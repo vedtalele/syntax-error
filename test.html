@@ -1,0 +1,28 @@
+<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Crumb AI test</title>
+<style>
+body{font:15px system-ui,sans-serif;max-width:760px;margin:24px auto;padding:0 16px;background:#0b1620;color:#f1e8d0}
+select,textarea,button{font:inherit;width:100%;margin:6px 0;padding:10px;border-radius:8px;border:1px solid #345;background:#10222f;color:inherit}
+button{background:#d9480f;border:0;font-weight:600;cursor:pointer}
+pre{white-space:pre-wrap;background:#10222f;padding:12px;border-radius:8px;min-height:80px}
+</style></head><body>
+<h2>Crumb AI proxy test</h2>
+<select id="agent">
+  <option>planner</option><option>critic</option><option>criteria</option>
+  <option>difficulty</option><option>spam</option><option>verifier</option><option>judge</option>
+</select>
+<textarea id="input" rows="9">I want a website for my college robotics club, called "RoboNova". Students should see upcoming events on the home page as cards. Each card shows the event name, date, time, venue and a short description. Our brand colours are dark blue (#0B1F3A) and orange (#FF7A00). Students register for an event with their name, college email (must end with @iitr.ac.in), branch and year. Each event has a seat limit, and when it is full the register button must change to "Event Full". Admin logs in with a password, sees registered students per event, and downloads a CSV. Registered students get a confirmation email. About 300 students expected.</textarea>
+<button id="go">Send to agent</button>
+<pre id="out">Result appears here…</pre>
+<script src="/ai-client.js"></script>
+<script>
+document.getElementById('go').onclick = async () => {
+  const out = document.getElementById('out'); out.textContent = 'Thinking…';
+  const t0 = Date.now();
+  try {
+    const d = await callAI(agent.value, input.value);
+    out.textContent = '✅ ' + (Date.now()-t0) + ' ms\n\n' + JSON.stringify(d, null, 2);
+  } catch (e) { out.textContent = '❌ ' + e.message; }
+};
+</script></body></html>
