@@ -459,6 +459,7 @@ textarea,input[type=text],input[type=number]{border-radius:4px;background:var(--
 <div class="toasts" id="toasts" aria-live="polite"></div>
 <div id="modal"></div>
 
+<script src="/ai-client.js"></script>
 <script>
 (function(){
 'use strict';
@@ -684,13 +685,54 @@ function renderUpload(){
 }
 function refreshPlan(){var p=$('#plan');if(p)p.innerHTML=planBody();var w=$('#pubwrap');if(w)w.innerHTML=pubBtn()}
 function refreshEcon(){var e=$('#econ');if(e)e.innerHTML=econ();var l=$('#tlist');if(l&&!state.shredding){l.innerHTML=planList(state.plan,analyse(state.plan)).replace(/ pop"/g,'"')}var w=$('#pubwrap');if(w)w.innerHTML=pubBtn()}
+/* ---------- AI shredding: planner -> critic -> criteria + difficulty ---------- */
+var SK_KIND={'UI Design':'design','Frontend':'frontend','Backend':'backend','Database':'backend','DevOps':'backend','Data/AI':'backend','Copywriting':'copy','Testing':'qa','Other':'frontend'};
+var SK_APP={'UI Design':['UI Design'],'Frontend':['React'],'Backend':['REST APIs'],'Database':['Databases'],'DevOps':['REST APIs'],'Data/AI':['REST APIs'],'Copywriting':['Copywriting'],'Testing':['Testing'],'Other':['HTML & CSS']};
+function aiCall(agent,obj){return window.callAI(agent,typeof obj==='string'?obj:JSON.stringify(obj))}
+function clampN(v,a,b,d){v=Math.round(Number(v));return isNaN(v)?d:Math.min(b,Math.max(a,v))}
+function breakCycles(plan){var by={},st={};plan.forEach(function(t){by[t.id]=t});
+  function visit(t){st[t.id]=1;t.deps=t.deps.filter(function(d){if(!by[d]||d===t.id||st[d]===1)return false;if(!st[d])visit(by[d]);return true});st[t.id]=2}
+  plan.forEach(function(t){if(!st[t.id])visit(t)})}
+function topoSort(plan){var by={},out=[],seen={};plan.forEach(function(t){by[t.id]=t});
+  function v(t){if(seen[t.id])return;seen[t.id]=1;t.deps.forEach(function(d){v(by[d])});out.push(t)}
+  plan.forEach(v);return out}
+function buildPlan(raw,crit,diff){
+  raw=raw.slice(0,12);var map={},cm={},dm={};
+  raw.forEach(function(t,i){map[String(t.id).toUpperCase()]='t'+(i+1)});
+  ((crit&&crit.criteria)||[]).forEach(function(c){cm[String(c.id).toUpperCase()]=c.acceptance_criteria||[]});
+  ((diff&&diff.difficulty)||[]).forEach(function(d){dm[String(d.id).toUpperCase()]=d});
+  var plan=raw.map(function(t,i){
+    var key=String(t.id).toUpperCase(),sk=SK_KIND[t.skill]?t.skill:'Other',d=dm[key]||{},ctx=String(t.context||'');
+    var deps=(Array.isArray(t.depends_on)?t.depends_on:[]).map(function(x){return map[String(x).toUpperCase()]}).filter(Boolean);
+    return {id:'t'+(i+1),title:String(t.title||('Task '+(i+1))).slice(0,80),kind:SK_KIND[sk],skills:SK_APP[sk].slice(),
+      eff:clampN(d.estimated_hours,1,6,3),diff:clampN(d.difficulty,1,5,3),w:1,deps:deps,
+      desc:String(t.description||''),ctx:/^none given/i.test(ctx)?'':ctx,
+      deliv:Array.isArray(t.deliverables)?t.deliverables.map(String):[],
+      accept:(cm[key]||[]).map(String),qs:Array.isArray(t.open_questions)?t.open_questions.map(String):[]}});
+  breakCycles(plan);return topoSort(plan)}
 function shred(){
-  if(state.shredding)return;state.shredding=true;state.published=false;
-  state.plan=PLAN0.map(function(t){return Object.assign({},t,{deps:t.deps.slice()})});
-  refreshPlan();
-  var msgs=['Reading your brief…','Finding the atomic pieces…','Mapping dependencies…','Estimating rewards…'],i=0;
-  var iv=setInterval(function(){i++;var m=$('#scanmsg');if(m&&msgs[i])m.textContent=msgs[i]},450);
-  setTimeout(function(){clearInterval(iv);state.shredding=false;refreshPlan();toast('Brief shredded into '+state.plan.length+' tasks')},1900);
+  if(state.shredding)return;
+  var brief=(state.brief||'').trim();
+  if(brief.length<20){toast('Write a few sentences about your project first');return}
+  state.shredding=true;state.published=false;state.plan=[];refreshPlan();
+  var step=function(m){var e=$('#scanmsg');if(e)e.textContent=m},raw;
+  aiCall('planner',brief.slice(0,6000)).then(function(p){
+    raw=p.tasks;step('Reviewing the plan for gaps…');
+    return aiCall('critic',{tasks:raw}).then(function(c){return(c&&Array.isArray(c.tasks)&&c.tasks.length)?c:{tasks:raw}},function(){return{tasks:raw}});
+  }).then(function(c){
+    raw=c.tasks;state.planIssues=c.issues_found||[];step('Writing acceptance criteria and pricing…');
+    var slim={tasks:raw.map(function(t){return{id:t.id,title:t.title,description:t.description,context:t.context,deliverables:t.deliverables,skill:t.skill}})};
+    return Promise.all([aiCall('criteria',slim).catch(function(){return null}),aiCall('difficulty',slim).catch(function(){return null})]);
+  }).then(function(r){
+    state.plan=buildPlan(raw,r[0],r[1]);state.shredding=false;refreshPlan();
+    if(typeof refreshEcon==='function')refreshEcon();
+    toast('Brief shredded into '+state.plan.length+' tasks');
+  }).catch(function(e){
+    state.shredding=false;
+    if(brief===SAMPLE){state.plan=PLAN0.map(function(t){return Object.assign({},t,{deps:t.deps.slice()})});toast('AI is busy, showing the saved sample plan')}
+    else{state.plan=[];toast('AI could not shred this brief: '+(e&&e.message||e))}
+    refreshPlan();if(typeof refreshEcon==='function')refreshEcon();
+  });
 }
 
 /* profile */
@@ -750,20 +792,62 @@ function submitModal(id){
   var t=findTask(id);
   openModal('<h3>Submit your work</h3><p class="hint">'+esc(t.title)+' · '+esc(t.project)+'</p><div><label class="lb" for="subTxt">Paste your solution, a link, or a short write-up</label><textarea id="subTxt" rows="6" placeholder="Describe your approach and include your result…"></textarea><p class="hint" style="margin-top:6px">Try typing &quot;asdf&quot; to see what the spam filter does.</p></div><div id="subRes"></div><div class="macts"><button class="btn" data-act="close">Close</button><button class="btn primary" data-act="runcheck" data-id="'+id+'">Run AI check</button></div>');
 }
+/* ---------- AI review: local junk filter -> spam guard -> verifier -> score in code -> judge ---------- */
+var GENERIC_CRITERIA=['The submission clearly addresses what the task asks for','Every deliverable named in the task is present or described','The work is specific to this task and not a generic restatement of it'];
+function normTxt(s){return String(s||'').toLowerCase().replace(/[^a-z0-9]+/g,' ').trim()}
+function looksLikeJunk(txt,t){
+  var s=txt.trim();
+  if(s.length<25)return 'That is too short to be a real attempt.';
+  if((s.match(/[A-Za-z]/g)||[]).length<15)return 'There is not enough readable text.';
+  var uniq={};s.toLowerCase().replace(/\s/g,'').split('').forEach(function(c){uniq[c]=1});
+  if(Object.keys(uniq).length<8)return 'The text is just repeated characters.';
+  var a=normTxt(s),b=normTxt(t.desc);if(a.length>20&&b&&(a===b||b.indexOf(a)>-1))return 'It only repeats the task description.';
+  return '';
+}
+function computeScore(res){
+  var pts=res.reduce(function(sum,r){return sum+(r.result==='pass'?1:r.result==='unclear'?.5:(r.evidence&&r.evidence!=='Not found in submission.'?.25:0))},0);
+  return res.length?Math.round(pts/res.length*100):0}
+function normResults(list,n){
+  var by={};(list||[]).forEach(function(r){by[Number(r.criterion_number)]=r});
+  var out=[];for(var i=1;i<=n;i++){var r=by[i]||{};out.push({criterion_number:i,result:/^(pass|fail|unclear)$/.test(r.result)?r.result:'unclear',evidence:String(r.evidence||'Not found in submission.'),why:String(r.why||'')})}
+  return out}
 function runCheck(id){
-  var t=findTask(id),txt=($('#subTxt').value||'').trim(),box=$('#subRes');
-  box.innerHTML='<div class="scan"><span class="spin"></span>Checking relevance, effort and originality…</div>';
-  setTimeout(function(){
-    if(txt.length<25){
-      state.coins=Math.max(0,state.coins-10);state.rep=Math.max(0,state.rep-3);updateChips();
-      box.innerHTML='<div class="res bad"><span style="color:var(--bad)">'+ic('x',30)+'</span><div><h4>Discarded as low-effort</h4><p>-10 crumbs and -3 reputation. Share a real attempt: explain your approach or include a link.</p></div></div>';
-    }else{
-      var sc=78+txt.length%18;state.coins+=t.base;state.completed++;state.submitted[id]=1;state.subs[id]={text:txt,score:sc,at:Date.now()};updateChips();notify({type:'ok',title:'Submission received',body:'"'+t.title+'" passed the AI check at '+sc+'%. '+t.base+' baseline crumbs were paid.',view:'work'});scheduleReview(t);
-      box.innerHTML='<div class="res good">'+scoreSvg(sc)+'<div><h4>Passed the spam filter · '+sc+'% match</h4><p><b>What worked:</b> clear and on-brief. <b>Next time:</b> add one concrete example and cover an edge case.</p><p>+'+t.base+' baseline crumbs paid by Crumb. The owner picks the winner when the timer ends, and the winner takes the prize.</p></div></div>';
-      var go=$('.macts .primary');if(go){go.outerHTML='<button class="btn primary" data-act="close">Done</button>'}
-      render();
-    }
-  },1000);
+  var t=findTask(id),txt=($('#subTxt').value||'').trim(),box=$('#subRes'),btn=$('.macts .primary');
+  if(state.submitted[id]){box.innerHTML='<div class="scan">You already delivered this one.</div>';return}
+  var scan=function(m){box.innerHTML='<div class="scan"><span class="spin"></span>'+esc(m)+'</div>'};
+  var unlock=function(){if(btn)btn.disabled=false};
+  var penalise=function(why){
+    state.coins=Math.max(0,state.coins-10);state.rep=Math.max(0,state.rep-3);updateChips();render();unlock();
+    box.innerHTML='<div class="res bad"><span style="color:var(--bad)">'+ic('x',30)+'</span><div><h4>Discarded as spam or low effort</h4><p>'+esc(why)+'</p><p>-10 crumbs and -3 reputation. Share a real attempt: explain your approach and paste your result.</p></div></div>'};
+  if(btn)btn.disabled=true;scan('Checking relevance, effort and originality…');
+  var junk=looksLikeJunk(txt,t);
+  if(junk){setTimeout(function(){penalise(junk)},500);return}
+  var task={title:t.title,description:t.desc||t.title,context:t.ctx||'',deliverables:t.deliv||[]};
+  var criteria=(t.accept&&t.accept.length)?t.accept:GENERIC_CRITERIA,sub=txt.slice(0,6000);
+  aiCall('spam',{task:task,submission:sub}).then(function(sp){
+    if(sp.verdict==='spam'&&(Number(sp.confidence)||0)>=0.7)return penalise(sp.why||'This looks like junk.');
+    if(sp.verdict!=='genuine'){
+      state.subs[id]={text:txt,score:null,at:Date.now(),pending:true};unlock();
+      notify({type:'info',title:'Sent for human review',body:'"'+t.title+'" needs the Captain to look at it. No crumbs were taken.',view:'work'});
+      box.innerHTML='<div class="res"><div><h4>Flagged for a human look</h4><p>'+esc(sp.why||'The check was not sure this is a full attempt.')+'</p><p>Nothing was deducted. Add more detail and run the check again, or wait for the Captain.</p></div></div>';return}
+    scan('Checking each criterion…');
+    return aiCall('verifier',{task:task,criteria:criteria.map(function(c,i){return{number:i+1,criterion:c}}),submission:sub}).then(function(v){
+      var res=normResults(v.results,criteria.length),sc=computeScore(res);scan('Writing feedback…');
+      return aiCall('judge',{task:task,spam_guard:sp,verifier_results:res,COMPUTED_SCORE:sc}).catch(function(){return null}).then(function(j){
+        j=j||{feedback:'',missing:[],needs_human_review:false};
+        var paid=sc>=30,flag=!!j.needs_human_review;
+        if(paid){state.coins+=t.base;state.completed++;state.submitted[id]=1;state.subs[id]={text:txt,score:sc,at:Date.now(),fb:j.feedback||'',missing:j.missing||[]};updateChips();
+          notify({type:'ok',title:'Submission received',body:'"'+t.title+'" scored '+sc+'%. '+t.base+' baseline crumbs were paid.',view:'work'});scheduleReview(t)}
+        var rows=res.map(function(r,i){return '<li>'+(r.result==='pass'?'✅':r.result==='fail'?'❌':'❓')+' '+esc(criteria[i])+'</li>'}).join('');
+        var miss=(j.missing&&j.missing.length)?'<p><b>To fix:</b> '+j.missing.map(esc).join('; ')+'</p>':'';
+        box.innerHTML='<div class="res '+(paid?'good':'bad')+'">'+scoreSvg(sc)+'<div><h4>'+(paid?'Passed the spam filter · '+sc+'% match':'Not enough yet · '+sc+'% match')+'</h4>'+
+          '<p>'+esc(j.feedback||'Review the criteria below and try again.')+'</p>'+miss+'<ul style="margin:8px 0 0 18px">'+rows+'</ul>'+
+          (flag?'<p class="hint">Some points could not be confirmed from text alone, so the Captain will take a closer look.</p>':'')+
+          (paid?'<p>+'+t.base+' baseline crumbs paid by Crumb. The owner picks the winner when the timer ends.</p>':'<p>No penalty. Improve the work and run the check again.</p>')+'</div></div>';
+        if(paid){var go=$('.macts .primary');if(go){go.outerHTML='<button class="btn primary" data-act="close">Done</button>'}render()}else unlock();
+      });
+    });
+  }).catch(function(e){unlock();box.innerHTML='<div class="res bad"><div><h4>The AI check could not run</h4><p>'+esc(e&&e.message||e)+'</p><p>Nothing was deducted. Try again in a moment.</p></div></div>'});
 }
 function questModal(){
   openModal('<h3>Fix this syntax error</h3><p class="hint">Proving Grounds · graded automatically</p><textarea id="qcode" class="code" rows="5" spellcheck="false">function add(a, b) {\n  return a + b\n</textarea><div id="qres"></div><div class="macts"><button class="btn" data-act="close">Close</button><button class="btn primary" data-act="qgrade">Grade with AI</button></div>');
@@ -949,9 +1033,13 @@ function renderQuests(){
 }
 /* wallet: every account starts at zero and keeps its balance and quest progress */
 function wkey(){return 'crumb_wallet_'+U().s}
-function ensureWallet(){var k=U().s;if(state.walletFor===k)return;state.walletFor=k;state.coins=0;state.quests={};state.qm=null;
-  try{var w=JSON.parse(localStorage.getItem(wkey())||'null');if(w){state.coins=w.coins||0;state.quests=w.quests||{};state.qm=w.qm||null}}catch(e){}}
-function saveWallet(){try{localStorage.setItem(wkey(),JSON.stringify({coins:state.coins,quests:state.quests,qm:state.qm}))}catch(e){}}
+var START_COINS=500;
+function ensureWallet(){var k=U().s;if(state.walletFor===k)return;state.walletFor=k;state.coins=START_COINS;state.quests={};state.qm=null;
+  try{var w=JSON.parse(localStorage.getItem(wkey())||'null');
+    /* wallets saved before v2 could hold 0 from the old bug: they get the starting grant once */
+    if(w&&w.v===2){state.coins=(typeof w.coins==='number')?w.coins:START_COINS;state.quests=w.quests||{};state.qm=w.qm||null}
+    else if(w){state.quests=w.quests||{};state.qm=w.qm||null;state.coins=Math.max(START_COINS,w.coins||0)}}catch(e){}}
+function saveWallet(){try{localStorage.setItem(wkey(),JSON.stringify({v:2,coins:state.coins,quests:state.quests,qm:state.qm}))}catch(e){}}
 function render(){ensureWallet();syncMonth();renderSide();renderTop();$('#view').innerHTML=state.view==='board'?renderBoard():state.view==='upload'?renderUpload():state.view==='projects'?renderProjects2():state.view==='work'?renderWork():state.view==='quests'?renderQuests():renderProfile();saveWallet()}
 function ensureProj(){var k=U().s;if(state.projFor===k)return;state.projFor=k;state.projects=[];try{var v=JSON.parse(localStorage.getItem(pkey())||'null');if(v&&v.length)state.projects=v}catch(e){}}
 function saveProject(name,at){ensureProj();var calc=planCalc();
@@ -1007,7 +1095,7 @@ document.addEventListener('click',function(e){
     pl.splice(j,1);state.published=false;refreshPlan();return toast('Task removed')}
   if(a==='publish'){
     var LV=[3,4,5,3,6,2,4,3],n=NOW,pname=projName(),pstamp=Date.now();
-    state.plan.forEach(function(t,i){TASKS.unshift({id:'n'+pstamp+i,project:pname,title:t.title,desc:'Posted from your brief. '+KIND[t.kind]+' work, about '+t.eff+' builder-hours.',kind:t.kind==='qa'?'qa':t.kind,skills:t.skills.map(function(s,q){return {n:s,lv:Math.min(LV[(i+q)%LV.length],MY[s]>0?MY[s]:LV[(i+q)%LV.length])}}),base:planCalc()[i].base,prize:planCalc()[i].prize,mult:Math.max(1,Math.round(planCalc()[i].prize/planCalc()[i].base)),claimed:0,max:state.maxB,left:state.sprint*3600,total:state.sprint*3600,endsAt:Date.now()+state.sprint*3600*1000,surge:0,unblocks:0,fresh:true,crit:!!analyse(state.plan).crit[i]})});
+    state.plan.forEach(function(t,i){TASKS.unshift({id:'n'+pstamp+i,project:pname,title:t.title,desc:(t.desc?(t.desc+(t.deliv&&t.deliv.length?' Deliver: '+t.deliv.join('; ')+'.':'')):('Posted from your brief. '+KIND[t.kind]+' work, about '+t.eff+' builder-hours.')),ctx:t.ctx||'',deliv:(t.deliv||[]).slice(),accept:(t.accept||[]).slice(),kind:t.kind==='qa'?'qa':t.kind,skills:t.skills.map(function(s,q){return {n:s,lv:Math.min(LV[(i+q)%LV.length],MY[s]>0?MY[s]:LV[(i+q)%LV.length])}}),base:planCalc()[i].base,prize:planCalc()[i].prize,mult:Math.max(1,Math.round(planCalc()[i].prize/planCalc()[i].base)),claimed:0,max:state.maxB,left:state.sprint*3600,total:state.sprint*3600,endsAt:Date.now()+state.sprint*3600*1000,surge:0,unblocks:0,fresh:true,crit:!!analyse(state.plan).crit[i]})});
     state.pool=prizeTotal();saveProject(pname,pstamp);state.coins-=state.pool;state.published=true;state.filter='all';state.sort='ending';
     toast(state.plan.length+' tasks are live. '+num(state.pool)+' crumbs are now held in escrow.');go('projects');return}
 });
